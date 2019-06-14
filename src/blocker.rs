@@ -8,8 +8,13 @@ use crate::filters::network::{NetworkFilter, NetworkMatchable, FilterError};
 use crate::request::Request;
 use crate::utils::{fast_hash, Hash};
 use crate::optimizer;
+<<<<<<< HEAD
 use crate::resources::{Resources, Resource};
 use base64;
+=======
+use std::cell::RefCell;
+use std::rc::Rc;
+>>>>>>> uses 'hot filters' list to speed up matching for likely matches; slightly speeds up positives and slows down negatives
 
 pub struct BlockerOptions {
     pub debug: bool,
@@ -71,7 +76,7 @@ pub struct Blocker {
     tagged_filters_all: Vec<NetworkFilter>,
 
     #[serde(skip_serializing, skip_deserializing)]
-    hot_filters: NetworkFilterList,
+    hot_filters: Rc<RefCell<NetworkFilterList>>,
 
     debug: bool,
     enable_optimizations: bool,
@@ -116,11 +121,23 @@ impl Blocker {
             })
             .or_else(|| {
                 #[cfg(feature = "metrics")]
+                print!("hot_filters\t");
+                let hot_filters = self.hot_filters.borrow();
+                hot_filters.check(request)
+            })
+            .or_else(|| {
+                #[cfg(feature = "metrics")]
                 print!("filters\t"); 
-                self.filters.check(request)
+                let maybe_filter = self.filters.check(request);
+
+                if let Some((filter, token)) = maybe_filter.as_ref() {
+                    self.hot_filter_add(&Arc::clone(&filter), *token)
+                }
+
+                maybe_filter
             });
 
-        let exception = filter.as_ref().and_then(|f| {
+        let exception = filter.as_ref().and_then(|(f, _)| {
             // Set `bug` of request
             if !f.is_important() {
                 #[cfg(feature = "metrics")]
@@ -168,10 +185,10 @@ impl Blocker {
         let matched = exception.is_none() && filter.is_some();
         BlockerResult {
             matched,
-            explicit_cancel: matched && filter.is_some() && filter.as_ref().map(|f| f.is_explicit_cancel()).unwrap_or_else(|| false),
+            explicit_cancel: matched && filter.is_some() && filter.as_ref().map(|(f, _)| f.is_explicit_cancel()).unwrap_or_else(|| false),
             redirect,
-            exception: exception.as_ref().map(|f| f.to_string()), // copy the exception
-            filter: filter.as_ref().map(|f| f.to_string()),       // copy the filter
+            exception: exception.as_ref().map(|(f, _)| f.to_string()), // copy the exception
+            filter: filter.as_ref().map(|(f, _)| f.to_string()),       // copy the filter
         }
     }
 
@@ -250,7 +267,7 @@ impl Blocker {
             // Tags special case for enabling/disabling them dynamically
             tags_enabled: HashSet::new(),
             tagged_filters_all,
-            hot_filters: NetworkFilterList::default(),
+            hot_filters: Rc::default(),
             // Options
             debug: options.debug,
             enable_optimizations: options.enable_optimizations,
@@ -259,6 +276,11 @@ impl Blocker {
 
             resources: Resources::default()
         }
+    }
+
+    fn hot_filter_add<'a>(&self, filter: &'a Arc<NetworkFilter>, token: Hash) {
+        let mut cache = self.hot_filters.borrow_mut();
+        cache.filter_arc_add(Arc::clone(&filter), token);
     }
 
     pub fn filter_exists(&self, filter: &NetworkFilter) -> Result<bool, BlockerError> {
@@ -440,6 +462,11 @@ impl NetworkFilterList {
         }
     }
 
+    pub fn filter_arc_add<'a>(&'a mut self, filter_pointer: Arc<NetworkFilter>, token: Hash) -> &'a mut NetworkFilterList {
+        insert_dup(&mut self.filter_map, token, filter_pointer);
+        self
+    }
+
     pub fn filter_add<'a>(&'a mut self, filter: NetworkFilter) -> &'a mut NetworkFilterList {
         let filter_tokens = filter.get_tokens();
         let total_rules = vec_hashmap_len(&self.filter_map);
@@ -491,7 +518,7 @@ impl NetworkFilterList {
         Ok(false)
     }
 
-    pub fn check(&self, request: &Request) -> Option<&NetworkFilter> {
+    pub fn check(&self, request: &Request) -> Option<(Arc<NetworkFilter>, Hash)> {
         #[cfg(feature = "metrics")]
         let mut filters_checked = 0;
         #[cfg(feature = "metrics")]
@@ -520,7 +547,7 @@ impl NetworkFilterList {
                         if filter.matches(request) {
                             #[cfg(feature = "metrics")]
                             print!("true\t{}\t{}\tskipped\t{}\t{}\t", filter_buckets, filters_checked, filter_buckets, filters_checked);
-                            return Some(filter);
+                            return Some((Arc::clone(filter), token.clone()));
                         }
                     }
                 }
@@ -544,7 +571,7 @@ impl NetworkFilterList {
                     if filter.matches(request) {
                         #[cfg(feature = "metrics")]
                         print!("true\t{}\t{}\t", filter_buckets, filters_checked);
-                        return Some(filter);
+                        return Some((Arc::clone(filter), token.clone()));
                     }
                 }
             }
@@ -787,7 +814,7 @@ mod tests {
             if *expected_result {
                 assert!(matched_rule.is_some(), "Expected match for {}", req.url);
             } else {
-                assert!(matched_rule.is_none(), "Expected no match for {}, matched with {}", req.url, matched_rule.unwrap().to_string());
+                assert!(matched_rule.is_none(), "Expected no match for {}, matched with {}", req.url, matched_rule.unwrap().0.to_string());
             }
         });
     }
